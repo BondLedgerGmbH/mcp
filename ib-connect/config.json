@@ -1,0 +1,26 @@
+{
+  "gateway_jar_path": "~/.ib-connect/gateway",
+  "cache_dir": "~/.ib-connect/cache",
+  "log_dir": "~/.ib-connect/logs",
+  "java_path": "/opt/homebrew/opt/openjdk/bin/java",
+  "browser_command": "open",
+  "cache_ttl_minutes": 60,
+  "api_call_delay_ms": 300,
+  "concentration_thresholds": {
+    "single_position_pct": 10.0,
+    "sector_pct": 30.0
+  },
+  "last_update_check": null,
+  "update_available": false,
+  "rollback_active": false,
+  "rollback_reason": null,
+  "accounts": {
+    "main": {
+      "port": 5100,
+      "account_id": "<YOUR_IB_ACCOUNT_ID>",
+      "label": "Main Account",
+      "type": "individual",
+      "tax_treatment": "no_capital_gains_tax"
+    }
+  }
+}
