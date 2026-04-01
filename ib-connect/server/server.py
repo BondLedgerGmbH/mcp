@@ -14,6 +14,7 @@ from .http_client import IBHttpClient
 from .gateway import GatewayManager
 from .market_data import MarketDataManager, INVERSE_ETF_INFO
 from .portfolio import PortfolioManager
+from .orders import OrderManager
 
 # --- Logging setup ---
 
@@ -52,6 +53,7 @@ http = IBHttpClient(api_call_delay_ms=cfg.get("api_call_delay_ms", 300))
 gateway = GatewayManager(cfg, http)
 market_data = MarketDataManager(cfg, http)
 portfolio = PortfolioManager(cfg, http)
+order_mgr = OrderManager(http=http, market_data=market_data)
 
 # --- Startup readiness gate ---
 # Data tools block until the full startup workflow completes:
@@ -60,6 +62,18 @@ portfolio = PortfolioManager(cfg, http)
 _startup_ready = threading.Event()
 _startup_phase = "initializing"
 _startup_error = None
+
+
+def _refresh_cfg():
+    """Reload config from disk into the module-level cfg dict.
+
+    Call after auto_discover_account_id() writes new account IDs to disk,
+    so that all tools see the updated values.
+    """
+    fresh = load_config()
+    cfg.update(fresh)
+    gateway.cfg = cfg
+    portfolio.cfg = cfg
 
 
 def _set_phase(phase: str):
@@ -89,7 +103,10 @@ except Exception as e:
 def _auto_start_gateways():
     global _startup_error
     try:
-        all_accounts = get_all_account_names(cfg)
+        all_accounts = [
+            acct for acct in get_all_account_names(cfg)
+            if cfg["accounts"][acct].get("auto_start", True)
+        ]
 
         # Phase 1: Start gateways and open login pages
         _set_phase("starting_gateways")
@@ -162,10 +179,7 @@ def _auto_start_gateways():
         _set_phase("loading_portfolio")
 
         # Reload config in case account IDs were just discovered
-        fresh_cfg = load_config()
-        cfg.update(fresh_cfg)
-        gateway.cfg = cfg
-        portfolio.cfg = cfg
+        _refresh_cfg()
 
         result = portfolio.get_full_summary(cfg, all_accounts, force_refresh=True)
 
@@ -222,14 +236,21 @@ def _check_startup_ready() -> dict | None:
 
 mcp = FastMCP(
     "ib-connect",
-    instructions="Interactive Brokers portfolio data server. Manages gateway lifecycle, authentication, and portfolio data retrieval across multiple accounts."
+    instructions="Interactive Brokers portfolio data server. Manages gateway lifecycle, authentication, portfolio data retrieval, and order execution across multiple accounts. Supports both live and paper trading modes."
 )
 
 
 def _resolve_accounts(account: str) -> list:
-    """Resolve account parameter to list of account names."""
+    """Resolve account parameter to list of account names.
+
+    'all' returns only live accounts. Paper accounts must be
+    requested explicitly by name.
+    """
     if account == "all" or not account:
-        return get_all_account_names(cfg)
+        return [
+            acct for acct in get_all_account_names(cfg)
+            if cfg["accounts"][acct].get("mode", "live") == "live"
+        ]
     return [account]
 
 
@@ -529,6 +550,7 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
         return auth_error
 
     # Auto-discover account IDs if needed
+    discovered_any = False
     for acct in accounts:
         acct_cfg = get_account_config(cfg, acct)
         if not acct_cfg.get("account_id"):
@@ -539,6 +561,9 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
                     "message": f"Could not auto-discover account ID for {acct}. "
                                f"Set it manually in ~/.ib-connect/config.json."
                 }
+            discovered_any = True
+    if discovered_any:
+        _refresh_cfg()
 
     result = portfolio.get_full_summary(cfg, accounts, force_refresh)
 
@@ -658,6 +683,498 @@ def ib_market_snapshot(
         if sym in INVERSE_ETF_INFO:
             data["inverse_etf_info"] = INVERSE_ETF_INFO[sym]
 
+    return result
+
+
+# === Order helpers ===
+
+
+def _get_positions_for_account(account_name: str) -> list:
+    """Get current positions for a specific account.
+
+    Returns list of position dicts with: ticker, position, market_value, currency, conid
+    """
+    return portfolio.get_positions(account_name)
+
+
+def _resolve_conid_for_order(
+    ticker: str, account: str, port: int, override_conid: int = 0
+) -> dict:
+    """Resolve a ticker to a conid for order placement.
+
+    Resolution priority:
+    1. Explicit conid override (from prior disambiguation)
+    2. Portfolio positions (ticker already held → use that conid)
+    3. IB secdef/search with disambiguation logic:
+       - Single STK result → use it
+       - Multiple results, same company → pick primary listing (most
+         derivative sections = home exchange). If tied → ambiguous.
+       - Multiple results, different companies → ambiguous.
+
+    Returns:
+        {"conid": int, "name": str}  on success
+        {"conid": int, "name": str, "position": float}  if found in portfolio
+        {"error": "ambiguous_symbol", "candidates": [...]}  if disambiguation needed
+        {"error": "symbol_not_found", "message": str}  if no results
+    """
+    # 1. Explicit override
+    if override_conid:
+        logger.info("Using explicit conid %d for %s", override_conid, ticker)
+        return {"conid": override_conid, "name": ticker}
+
+    # 2. Check portfolio positions
+    try:
+        positions = _get_positions_for_account(account)
+        pos = next((p for p in positions if p["ticker"] == ticker), None)
+        if pos and pos.get("conid"):
+            logger.info(
+                "Resolved %s -> conid %s from portfolio positions",
+                ticker, pos["conid"],
+            )
+            return {
+                "conid": pos["conid"],
+                "name": ticker,
+                "position": pos.get("position", 0),
+            }
+    except Exception as e:
+        logger.info("Portfolio position lookup failed for %s/%s: %s", ticker, account, e)
+        pass  # fall through to search
+
+    # 3. IB search with disambiguation
+    candidates = market_data.search_symbol_candidates(ticker, port)
+    if not candidates:
+        return {"error": "symbol_not_found", "message": f"Symbol not found: {ticker}"}
+
+    if len(candidates) == 1:
+        c = candidates[0]
+        logger.info(
+            "Resolved %s -> conid %s (%s, %s) — single result",
+            ticker, c["conid"], c["name"], c["exchange"],
+        )
+        return {"conid": c["conid"], "name": c["name"]}
+
+    # Multiple candidates — pick primary listing by section count.
+    # Primary listings (home exchange) have more derivative sections
+    # (OPT, FUT, WAR) than secondary listings (STK only).
+    top = candidates[0]  # already sorted by num_sections desc
+    runner_up = candidates[1]
+    if top["num_sections"] > runner_up["num_sections"]:
+        logger.info(
+            "Resolved %s -> conid %s (%s, %s) — primary listing "
+            "(%d sections vs %d)",
+            ticker, top["conid"], top["name"], top["exchange"],
+            top["num_sections"], runner_up["num_sections"],
+        )
+        return {"conid": top["conid"], "name": top["name"]}
+
+    # Same section count or genuinely ambiguous — return candidates
+    company_names = set(c["name"].upper() for c in candidates)
+    logger.info(
+        "Ambiguous symbol %s: %d candidates across %d company name(s), "
+        "top sections=%d",
+        ticker, len(candidates), len(company_names),
+        top["num_sections"],
+    )
+    return {
+        "error": "ambiguous_symbol",
+        "message": (
+            f"Multiple matches for {ticker}. Specify which one by "
+            f"passing the conid directly."
+        ),
+        "candidates": [
+            {"conid": c["conid"], "name": c["name"], "exchange": c["exchange"]}
+            for c in candidates
+        ],
+    }
+
+
+# === Order tools ===
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+def ib_place_order(
+    account: str,
+    ticker: str,
+    side: str,
+    quantity: float = 0,
+    cash_amount: float = 0,
+    order_type: str = "MKT",
+    limit_price: float = 0,
+    stop_price: float = 0,
+    tif: str = "DAY",
+    outside_rth: bool = False,
+    conid: int = 0,
+) -> dict:
+    """Place an order on Interactive Brokers.
+
+    Resolves the ticker to a contract ID, calculates quantity if cash_amount
+    is provided, builds the order, and submits it (handling IB's confirmation
+    loop automatically).
+
+    IMPORTANT: The calling skill must obtain user confirmation BEFORE calling
+    this tool. This tool submits the order immediately.
+
+    Args:
+        account: Account name as configured in config.json (e.g., "main",
+                 "main-paper").
+        ticker: Stock/ETF symbol (e.g., "AVAV", "CSH2", "SPY").
+        side: "BUY" or "SELL".
+        quantity: Number of shares. Required unless cash_amount is provided.
+                  For SELL ALL: set to -1 (the tool fetches current position size).
+        cash_amount: Dollar amount to invest (e.g., 9200.0). The tool calculates
+                     shares from current price. Mutually exclusive with quantity.
+        order_type: "MKT" (market), "LMT" (limit), "STP" (stop),
+                    "STP_LIMIT" (stop-limit). Default: "MKT".
+        limit_price: Required for LMT and STP_LIMIT orders.
+        stop_price: Required for STP and STP_LIMIT orders.
+        tif: Time-in-force: "DAY", "GTC", "IOC", "OPG". Default: "DAY".
+        outside_rth: Allow fills outside regular trading hours. Default: false.
+        conid: Explicit contract ID (skips ticker resolution). Use after
+               disambiguation when multiple matches exist for a ticker.
+
+    Returns:
+        On success: {"success": true, "order_id": "...", "order_status": "...",
+                     "ticker": "...", "side": "...", "quantity": N,
+                     "order_type": "...", "account": "...", "mode": "live|paper"}
+        On error: {"error": "error_code", "message": "..."}
+        On ambiguous ticker: {"error": "ambiguous_symbol", "candidates": [...]}
+    """
+    logger.info(
+        "Tool call: ib_place_order(account=%s, ticker=%s, side=%s, qty=%s, cash=%s, type=%s)",
+        account, ticker, side, quantity, cash_amount, order_type,
+    )
+
+    startup_error = _check_startup_ready()
+    if startup_error:
+        return startup_error
+
+    gateway.tickle_all()
+
+    try:
+        acct_cfg = get_account_config(cfg, account)
+    except ValueError:
+        return {"error": "invalid_account", "message": f"Unknown account: {account}"}
+
+    port = acct_cfg["port"]
+    account_id = acct_cfg.get("account_id")
+    mode = acct_cfg.get("mode", "live")
+
+    if not account_id:
+        account_id = gateway.auto_discover_account_id(account)
+        if account_id:
+            _refresh_cfg()
+            acct_cfg = get_account_config(cfg, account)
+        else:
+            return {
+                "error": "account_not_discovered",
+                "message": f"Account ID for {account} not yet discovered. Start gateway and authenticate first.",
+            }
+
+    auth_error = _check_auth_error([account])
+    if auth_error:
+        return auth_error
+
+    # Validate inputs
+    side = side.upper()
+    if side not in ("BUY", "SELL"):
+        return {"error": "invalid_side", "message": "side must be BUY or SELL"}
+
+    if quantity == 0 and cash_amount == 0:
+        return {"error": "no_quantity", "message": "Provide either quantity or cash_amount"}
+
+    if quantity != 0 and cash_amount != 0:
+        return {"error": "ambiguous_quantity", "message": "Provide quantity OR cash_amount, not both"}
+
+    order_type = order_type.upper()
+
+    # Resolve symbol to conid (portfolio → search → disambiguate)
+    resolution = _resolve_conid_for_order(ticker, account, port, conid)
+    if "error" in resolution:
+        return resolution
+    resolved_conid = resolution["conid"]
+
+    # Handle SELL ALL (quantity == -1)
+    if quantity == -1:
+        pos_qty = resolution.get("position")
+        if pos_qty and pos_qty > 0:
+            quantity = pos_qty
+        else:
+            # Position not found via resolution, try explicit lookup
+            try:
+                positions = _get_positions_for_account(account)
+                pos = next((p for p in positions if p["ticker"] == ticker), None)
+                if not pos or pos["position"] <= 0:
+                    return {"error": "no_position", "message": f"No {ticker} position found in {account}"}
+                quantity = pos["position"]
+            except Exception as e:
+                return {"error": "position_lookup_failed", "message": str(e)}
+
+    # Handle cash-based ordering
+    if cash_amount > 0:
+        try:
+            price = order_mgr.get_last_price(resolved_conid, port)
+            quantity = order_mgr.calculate_shares_from_cash(cash_amount, price)
+            logger.info(
+                "Cash order: $%.2f / $%.2f = %d shares of %s",
+                cash_amount, price, quantity, ticker,
+            )
+        except ValueError as e:
+            return {"error": "cash_calculation_failed", "message": str(e)}
+
+    # Build and submit order
+    try:
+        payload = order_mgr.build_order_payload(
+            conid=resolved_conid,
+            side=side,
+            quantity=abs(quantity),
+            order_type=order_type,
+            limit_price=limit_price if limit_price > 0 else None,
+            stop_price=stop_price if stop_price > 0 else None,
+            tif=tif,
+            outside_rth=outside_rth,
+            ticker=ticker,
+        )
+        result = order_mgr.submit_order(port, account_id, payload)
+    except ValueError as e:
+        return {"error": "order_failed", "message": str(e)}
+
+    return {
+        "success": True,
+        "order_id": result["order_id"],
+        "order_status": result["order_status"],
+        "warning_messages": result.get("warning_messages", []),
+        "ticker": ticker,
+        "side": side,
+        "quantity": abs(quantity),
+        "order_type": order_type,
+        "limit_price": limit_price if limit_price > 0 else None,
+        "account": account,
+        "account_label": acct_cfg["label"],
+        "mode": mode,
+    }
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+def ib_order_preview(
+    account: str,
+    ticker: str,
+    side: str,
+    quantity: float = 0,
+    cash_amount: float = 0,
+    order_type: str = "MKT",
+    limit_price: float = 0,
+    stop_price: float = 0,
+    conid: int = 0,
+) -> dict:
+    """Preview an order without submitting (what-if analysis).
+
+    Returns estimated commission, margin impact, and any warnings.
+    Use this before ib_place_order to show the user what will happen.
+
+    Args:
+        account: Account name.
+        ticker: Stock/ETF symbol.
+        side: "BUY" or "SELL".
+        quantity: Number of shares (or -1 for SELL ALL).
+        cash_amount: Dollar amount (alternative to quantity).
+        order_type: "MKT", "LMT", "STP", "STP_LIMIT".
+        limit_price: For limit orders.
+        stop_price: For stop orders.
+        conid: Explicit contract ID (skips ticker resolution).
+
+    Returns:
+        Preview data including: ticker, side, quantity, estimated_value,
+        commission, margin_impact, warnings, last_price (for cash orders).
+        On ambiguous ticker: {"error": "ambiguous_symbol", "candidates": [...]}
+    """
+    logger.info(
+        "Tool call: ib_order_preview(account=%s, ticker=%s, side=%s)",
+        account, ticker, side,
+    )
+
+    startup_error = _check_startup_ready()
+    if startup_error:
+        return startup_error
+
+    gateway.tickle_all()
+
+    try:
+        acct_cfg = get_account_config(cfg, account)
+    except ValueError:
+        return {"error": "invalid_account", "message": f"Unknown account: {account}"}
+
+    port = acct_cfg["port"]
+    account_id = acct_cfg.get("account_id")
+    if not account_id:
+        account_id = gateway.auto_discover_account_id(account)
+        if account_id:
+            _refresh_cfg()
+            acct_cfg = get_account_config(cfg, account)
+        else:
+            return {
+                "error": "account_not_discovered",
+                "message": f"Account ID for {account} not yet discovered.",
+            }
+
+    auth_error = _check_auth_error([account])
+    if auth_error:
+        return auth_error
+
+    side = side.upper()
+    order_type = order_type.upper()
+
+    # Resolve symbol to conid (portfolio → search → disambiguate)
+    resolution = _resolve_conid_for_order(ticker, account, port, conid)
+    if "error" in resolution:
+        return resolution
+    resolved_conid = resolution["conid"]
+
+    # Handle SELL ALL
+    resolved_quantity = quantity
+    if quantity == -1:
+        pos_qty = resolution.get("position")
+        if pos_qty and pos_qty > 0:
+            resolved_quantity = pos_qty
+        else:
+            try:
+                positions = _get_positions_for_account(account)
+                pos = next((p for p in positions if p["ticker"] == ticker), None)
+                if not pos or pos["position"] <= 0:
+                    return {"error": "no_position", "message": f"No {ticker} position in {account}"}
+                resolved_quantity = pos["position"]
+            except Exception as e:
+                return {"error": "position_lookup_failed", "message": str(e)}
+
+    # Handle cash-based
+    last_price = None
+    if cash_amount > 0:
+        try:
+            last_price = order_mgr.get_last_price(resolved_conid, port)
+            resolved_quantity = order_mgr.calculate_shares_from_cash(cash_amount, last_price)
+        except ValueError as e:
+            return {"error": "cash_calculation_failed", "message": str(e)}
+
+    # Build payload and preview
+    try:
+        payload = order_mgr.build_order_payload(
+            conid=resolved_conid,
+            side=side,
+            quantity=abs(resolved_quantity),
+            order_type=order_type,
+            limit_price=limit_price if limit_price > 0 else None,
+            stop_price=stop_price if stop_price > 0 else None,
+            ticker=ticker,
+        )
+        preview = order_mgr.preview_order(port, account_id, payload)
+    except ValueError as e:
+        return {"error": "preview_failed", "message": str(e)}
+
+    preview["ticker"] = ticker
+    preview["side"] = side
+    preview["quantity"] = abs(resolved_quantity)
+    preview["order_type"] = order_type
+    preview["account"] = account
+    preview["account_label"] = acct_cfg["label"]
+    preview["mode"] = acct_cfg.get("mode", "live")
+    if last_price:
+        preview["last_price"] = last_price
+        preview["cash_amount_requested"] = cash_amount
+        preview["estimated_value"] = abs(resolved_quantity) * last_price
+        preview["cash_remainder"] = cash_amount - (abs(resolved_quantity) * last_price)
+    return preview
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+def ib_order_status(account: str = "all") -> dict:
+    """List live and recent orders.
+
+    Args:
+        account: Account name or "all". Default: "all".
+
+    Returns:
+        {"accounts": {"account_name": {"orders": [...]}}}
+    """
+    logger.info("Tool call: ib_order_status(account=%s)", account)
+
+    startup_error = _check_startup_ready()
+    if startup_error:
+        return startup_error
+
+    gateway.tickle_all()
+
+    accounts = _resolve_accounts(account)
+    # For order status, also allow explicit paper accounts
+    if account not in ("all", "") and account not in accounts:
+        accounts = [account]
+
+    result = {}
+    for acct in accounts:
+        try:
+            acct_cfg = get_account_config(cfg, acct)
+        except ValueError:
+            result[acct] = {"error": f"Unknown account: {acct}"}
+            continue
+        port = acct_cfg["port"]
+        status = gateway.get_status(acct)
+        if not status["authenticated"]:
+            result[acct] = {"error": "Not authenticated"}
+            continue
+        orders = order_mgr.get_live_orders(port)
+        result[acct] = orders
+
+    return {"accounts": result}
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+def ib_cancel_order(account: str, order_id: str) -> dict:
+    """Cancel a live order.
+
+    Args:
+        account: Account name (must be specific, not "all").
+        order_id: Order ID from ib_place_order or ib_order_status.
+
+    Returns:
+        Cancellation confirmation or error.
+    """
+    logger.info("Tool call: ib_cancel_order(account=%s, order_id=%s)", account, order_id)
+
+    startup_error = _check_startup_ready()
+    if startup_error:
+        return startup_error
+
+    gateway.tickle_all()
+
+    if account == "all":
+        return {
+            "error": "account_required",
+            "message": "Must specify a single account for cancellation.",
+        }
+
+    try:
+        acct_cfg = get_account_config(cfg, account)
+    except ValueError:
+        return {"error": "invalid_account", "message": f"Unknown account: {account}"}
+
+    port = acct_cfg["port"]
+    account_id = acct_cfg.get("account_id")
+    if not account_id:
+        account_id = gateway.auto_discover_account_id(account)
+        if account_id:
+            _refresh_cfg()
+            acct_cfg = get_account_config(cfg, account)
+        else:
+            return {
+                "error": "account_not_discovered",
+                "message": f"Account ID for {account} not yet discovered.",
+            }
+
+    auth_error = _check_auth_error([account])
+    if auth_error:
+        return auth_error
+
+    result = order_mgr.cancel_order(port, account_id, order_id)
+    result["account"] = account
+    result["account_label"] = acct_cfg["label"]
     return result
 
 

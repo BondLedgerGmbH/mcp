@@ -123,6 +123,50 @@ class MarketDataManager:
             logger.error("secdef search failed for %s: %s", symbol, e)
             return None
 
+    def search_symbol_candidates(self, symbol: str, port: int) -> list[dict]:
+        """Search for all STK candidates for a symbol.
+
+        Returns a list of candidates sorted by relevance (most sections first):
+        [{"conid": int, "name": str, "exchange": str, "num_sections": int}, ...]
+
+        Used by order tools to detect ambiguous tickers. Returns empty list
+        on error or no results.
+        """
+        try:
+            resp = self.http.post(
+                f"https://localhost:{port}/v1/api/iserver/secdef/search",
+                json={"symbol": symbol},
+            )
+            if resp.status_code != 200:
+                return []
+
+            results = resp.json()
+            if not results:
+                return []
+
+            candidates = []
+            for r in results:
+                has_stk = any(
+                    s.get("secType") == "STK" for s in r.get("sections", [])
+                )
+                if not has_stk:
+                    continue
+                candidates.append({
+                    "conid": int(r.get("conid")),
+                    "name": r.get("companyName", symbol),
+                    "exchange": r.get("description", ""),
+                    "num_sections": len(r.get("sections", [])),
+                })
+
+            # Sort by number of sections descending — primary listings tend to
+            # have OPT/FUT/WAR sections while secondary listings have only STK.
+            candidates.sort(key=lambda c: c["num_sections"], reverse=True)
+            return candidates
+
+        except Exception as e:
+            logger.error("search_symbol_candidates failed for %s: %s", symbol, e)
+            return []
+
     # ------------------------------------------------------------------
     # Option strikes
     # ------------------------------------------------------------------

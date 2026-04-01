@@ -8,6 +8,9 @@ venv/
 # macOS
 .DS_Store
 
+# Runtime config (contains account IDs and secrets)
+*/config.json
+
 # Runtime data (when running from repo checkout)
 */cache/
 */logs/

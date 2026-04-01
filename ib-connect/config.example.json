@@ -16,7 +16,18 @@
       "account_id": "",
       "label": "Main Account",
       "type": "individual",
-      "tax_treatment": "no_capital_gains_tax"
+      "tax_treatment": "no_capital_gains_tax",
+      "mode": "live"
+    },
+    "main-paper": {
+      "port": 5200,
+      "account_id": "",
+      "label": "Main Account (Paper)",
+      "type": "individual",
+      "tax_treatment": "no_capital_gains_tax",
+      "mode": "paper",
+      "live_account": "main",
+      "auto_start": false
     }
   }
 }

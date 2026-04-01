@@ -6,4 +6,4 @@ A collection of [Model Context Protocol](https://modelcontextprotocol.io/) serve
 
 | Server | Description |
 |--------|-------------|
-| [ib-connect](./ib-connect/) | Interactive Brokers Client Portal Gateway — portfolio data, market snapshots, and option chains |
+| [ib-connect](./ib-connect/) | Interactive Brokers Client Portal Gateway — portfolio data, market snapshots, option chains, and order execution |

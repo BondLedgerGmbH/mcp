@@ -1,14 +1,18 @@
 # ib-connect
 
-MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecycle, authentication, and portfolio/market data retrieval across multiple accounts.
+MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecycle, authentication, portfolio/market data retrieval, and order execution across multiple accounts. Supports both live and paper trading modes.
 
 ## Features
 
 - Multi-account gateway management (start, stop, re-authenticate)
+- Live and paper trading modes (paper accounts excluded from auto-start and "all" resolution)
 - Auto-discovery of IB account IDs on first connection
 - Portfolio data: positions, balances, allocations, concentration flags
 - Market data: multi-symbol snapshots with inverse ETF metadata
 - Option chains: filtered by strike range with live pricing, IV, and greeks
+- Order management: place, preview (what-if), status, and cancel orders
+- Smart ticker resolution: portfolio positions → IB search → disambiguation
+- Cash-based ordering (specify dollar amount instead of shares)
 - Portfolio caching with configurable TTL
 - FX rate conversion for multi-currency portfolios
 - Gateway auto-update with rollback support
@@ -52,15 +56,27 @@ Edit `config.json` to add your account(s):
       "account_id": "",
       "label": "My Account",
       "type": "individual",
-      "tax_treatment": "no_capital_gains_tax"
+      "tax_treatment": "no_capital_gains_tax",
+      "mode": "live"
+    },
+    "main-paper": {
+      "port": 5200,
+      "account_id": "",
+      "label": "My Account (Paper)",
+      "type": "individual",
+      "tax_treatment": "no_capital_gains_tax",
+      "mode": "paper",
+      "live_account": "main",
+      "auto_start": false
     }
   }
 }
 ```
 
-The `account_id` field is auto-discovered on first successful authentication. Leave it empty.
-
-For multiple accounts, assign different ports (e.g., 5100, 5101). Avoid ports 5000/5001 on macOS (AirPlay Receiver conflict).
+- `account_id` is auto-discovered on first successful authentication. Leave it empty.
+- `mode`: `"live"` (default) or `"paper"`. Paper accounts are excluded from `"all"` account resolution and auto-start.
+- `auto_start`: Set to `false` for accounts that should not start automatically on MCP connect.
+- For multiple accounts, assign different ports (e.g., 5100, 5101). Avoid ports 5000/5001 on macOS (AirPlay Receiver conflict).
 
 ## Claude Desktop / Claude Code Setup
 
@@ -91,6 +107,10 @@ Add to your MCP configuration:
 | `ib_portfolio_summary` | Combined view: positions + balances + allocations + concentration flags |
 | `ib_option_chain` | Filtered option chain with live pricing, IV, and greeks |
 | `ib_market_snapshot` | Market data snapshots for multiple symbols |
+| `ib_place_order` | Place an order (market, limit, stop, stop-limit) |
+| `ib_order_preview` | Preview order impact without submitting (what-if analysis) |
+| `ib_order_status` | List live and recent orders |
+| `ib_cancel_order` | Cancel a live order |
 
 ## Known Data Limitations
 
@@ -104,7 +124,7 @@ The IB Client Portal Gateway snapshot API has these limitations that consumers s
 
 On MCP server connect, the server automatically:
 
-1. Starts gateway instances for all configured accounts
+1. Starts gateway instances for all accounts with `auto_start: true` (default)
 2. Opens login pages in the default browser
 3. Polls for authentication completion (up to 5 minutes)
 4. Auto-discovers account IDs if not configured

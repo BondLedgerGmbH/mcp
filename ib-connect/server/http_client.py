@@ -28,7 +28,7 @@ class IBHttpClient:
             total=3,
             backoff_factor=1,  # 1s, 2s, 4s
             status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
+            allowed_methods=["GET", "POST", "DELETE"],
         )
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
@@ -62,6 +62,16 @@ class IBHttpClient:
         resp = self._session.post(url, timeout=timeout, **kwargs)
         duration = time.time() - start
         logger.info("POST %s -> %d (%.1fs)", url, resp.status_code, duration)
+        return resp
+
+    def delete(self, url: str, timeout: int = 10, rate_limit: bool = True, **kwargs) -> requests.Response:
+        if rate_limit:
+            self._rate_limit()
+        logger.debug("DELETE %s", url)
+        start = time.time()
+        resp = self._session.delete(url, timeout=timeout, **kwargs)
+        duration = time.time() - start
+        logger.info("DELETE %s -> %d (%.1fs)", url, resp.status_code, duration)
         return resp
 
     def health_check(self, port: int, timeout: int = 5) -> bool:
