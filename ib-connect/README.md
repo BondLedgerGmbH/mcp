@@ -120,6 +120,50 @@ The IB Client Portal Gateway snapshot API has these limitations that consumers s
 - **`theta` and `vega`**: Always null. The snapshot endpoint does not return these greeks.
 - **`open_interest`**: Always null. Not provided by the snapshot endpoint.
 
+### Architecture
+
+```
+Claude Code
+    │
+    │ MCP (stdio transport)
+    ▼
+ib-connect MCP Server (Python/FastMCP)
+    │
+    │ HTTPS (self-signed cert)
+    ▼
+IB Client Portal Gateway (Java)  ×N instances (one per account)
+    │              │
+    │ port 5100    │ port 5101    ...
+    ▼              ▼
+Account A      Account B      ...
+(live)         (live/paper)
+```
+
+### Directory Structure
+
+```
+~/.ib-connect/
+├── run_server.py              # Entry point
+├── config.json                # Account config (generated from example)
+├── config.example.json        # Template config
+├── server/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── server.py              # FastMCP tool definitions (13 tools)
+│   ├── config.py              # Config management
+│   ├── gateway.py             # Gateway lifecycle (start/stop/auth/update)
+│   ├── http_client.py         # Rate-limited HTTP client for IB API
+│   ├── market_data.py         # Security search, option chains, snapshots
+│   ├── orders.py              # Order placement, preview, status, cancellation
+│   └── portfolio.py           # Positions, balances, allocations, caching
+├── gateway/                   # IB CP Gateway base installation (Java)
+├── gateway-<account>/         # Per-account gateway copies (created on first start)
+├── cache/                     # Portfolio data cache (configurable TTL)
+├── logs/                      # Server and gateway logs
+├── pids/                      # Gateway PID files
+└── venv/                      # Python virtual environment
+```
+
 ## Startup Behaviour
 
 On MCP server connect, the server automatically:
@@ -132,6 +176,42 @@ On MCP server connect, the server automatically:
 6. Pulls and caches initial portfolio data
 
 Data tools block until this startup sequence completes.
+
+### Market Data Notes
+
+- The snapshot endpoint has a subscription warm-up: first call may return stale/empty data, second call after ~1.5s returns live data. The server handles this with automatic retry (up to 3 attempts).
+- After data retrieval, subscriptions are cleaned up via `unsubscribeall` to free slots.
+- Maximum ~100 concurrent market data subscriptions per gateway session.
+
+Option chain retrieval pipeline:
+1. Symbol search → conid resolution (cached)
+2. Available strikes for expiry month
+3. Filter strikes to specified % range of current price (capped at 30)
+4. Resolve individual option contract conids
+5. Batch market data snapshots (groups of 20)
+6. Combine and return structured data with greeks
+
+### Gateway Update Management
+
+The server checks for gateway updates every 24 hours (HEAD request to IB download URL). Updates are applied via `ib_start_gateway` with automatic rollback if the new version fails to start.
+
+### Logs
+
+- Server log: `~/.ib-connect/logs/mcp-server.log`
+- Gateway logs: `~/.ib-connect/logs/gateway-{account}.log`
+- Log rotation at 10MB
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| "startup_in_progress" on tool calls | Wait for auth to complete, or check logs for errors |
+| "gateway_not_running" | Run `ib_start_gateway` |
+| "auth_required" | Run `ib_reauthenticate`, complete browser login |
+| Option chain returns no data | Check market hours, verify underlying is optionable |
+| Snapshot returns stale "C"-prefixed values | Market is closed; data is closing prices |
+| Port conflict | Check for other processes; disable AirPlay Receiver if on 5000/5001 |
+| Paper account not starting | Paper accounts have `auto_start: false` — start manually |
 
 ## License
 
