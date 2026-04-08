@@ -15,6 +15,7 @@ from .gateway import GatewayManager
 from .market_data import MarketDataManager, INVERSE_ETF_INFO
 from .portfolio import PortfolioManager
 from .orders import OrderManager
+from .performance import PerformanceManager, VALID_PERIODS
 
 # --- Logging setup ---
 
@@ -54,6 +55,7 @@ gateway = GatewayManager(cfg, http)
 market_data = MarketDataManager(cfg, http)
 portfolio = PortfolioManager(cfg, http)
 order_mgr = OrderManager(http=http, market_data=market_data)
+perf_mgr = PerformanceManager(cfg, http)
 
 # --- Startup readiness gate ---
 # Data tools block until the full startup workflow completes:
@@ -1176,6 +1178,61 @@ def ib_cancel_order(account: str, order_id: str) -> dict:
     result["account"] = account
     result["account_label"] = acct_cfg["label"]
     return result
+
+
+# === Performance tools ===
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+def ib_performance(account: str = "all", periods: str = "") -> dict:
+    """Get time-weighted return (TWR) performance for accounts.
+
+    Returns cumulative returns, monthly returns, and NAV series from the
+    IB Portfolio Analyst API. Data is computed by IB from actual account
+    history including dividends, fees, and FX effects.
+
+    Args:
+        account: Account name (e.g., "account1", "account2") or "all". Default: "all".
+        periods: Comma-separated periods to fetch. Valid: 1D, 7D, MTD, 1M, YTD, 1Y.
+                 Default (empty): fetches all periods.
+    """
+    logger.info("Tool call: ib_performance(account=%s, periods=%s)", account, periods)
+    startup_error = _check_startup_ready()
+    if startup_error:
+        return startup_error
+
+    accounts = _resolve_accounts(account)
+    ready, auth_error = _filter_ready_accounts(accounts)
+    if auth_error:
+        return auth_error
+
+    period_list = [p.strip() for p in periods.split(",") if p.strip()] if periods else None
+
+    all_results = {}
+    for acct in ready:
+        acct_cfg = get_account_config(cfg, acct)
+        perf = perf_mgr.get_performance(acct, period_list)
+        all_results[acct] = {
+            "account_id": acct_cfg.get("account_id", ""),
+            "label": acct_cfg["label"],
+            "periods": perf,
+        }
+
+    # Build a summary table for quick reading
+    summary = {}
+    for acct, data in all_results.items():
+        summary[acct] = {
+            p: data["periods"][p].get("cumulative_return_pct", "N/A")
+            for p in data["periods"]
+            if "error" not in data["periods"][p]
+        }
+
+    return {
+        "accounts": all_results,
+        "summary": summary,
+        "valid_periods": list(VALID_PERIODS),
+        "performance_method": "TWR",
+    }
 
 
 # === Entry point ===
