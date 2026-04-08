@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -18,9 +19,9 @@ EXCHANGE_GEOGRAPHY = {
     "LSE": "Europe", "LSEETF": "Europe", "SBF": "Europe", "IBIS": "Europe",
     "AEB": "Europe", "BM": "Europe", "VSE": "Europe", "SWX": "Europe",
     "BVME": "Europe", "ENEXT.BE": "Europe", "FWB": "Europe", "XETRA": "Europe",
-    "EBS": "Europe", "OMXS": "Europe", "OMXH": "Europe", "OMXC": "Europe",
+    "EBS": "Europe", "IBIS2": "Europe", "OMXS": "Europe", "OMXH": "Europe", "OMXC": "Europe",
     "OSE": "Europe", "WSE": "Europe", "BIST": "Europe",
-    "TSE": "Asia", "SEHK": "Asia", "SGX": "Asia", "KSE": "Asia",
+    "TSE": "Asia", "TSEJ": "Asia", "SEHK": "Asia", "SGX": "Asia", "KSE": "Asia",
     "TWSE": "Asia", "NSE": "Asia", "BSE": "Asia", "ASX": "Asia-Pacific",
     "NZX": "Asia-Pacific", "TASE": "Middle East",
     "JSE": "Africa", "BMV": "Latin America", "BOVESPA": "Latin America",
@@ -190,10 +191,24 @@ class PortfolioManager:
                 logger.error("Failed to fetch FX rate for %s: %s", ccy, e)
         return rates
 
+    _bg_refresh_lock = threading.Lock()
+    _bg_refresh_running = False
+
+    def _background_refresh(self, cfg: dict, accounts: list | None):
+        """Refresh cache in background."""
+        try:
+            self.get_full_summary(cfg, accounts, force_refresh=True)
+        except Exception as e:
+            logger.warning("Background portfolio refresh failed: %s", e)
+        finally:
+            with self._bg_refresh_lock:
+                PortfolioManager._bg_refresh_running = False
+
     def get_full_summary(self, cfg: dict, accounts: list | None = None, force_refresh: bool = False) -> dict:
         """
         Full combined portfolio: positions + balances + allocations + concentration flags.
         Uses cache unless force_refresh or cache expired.
+        If cache is stale, returns it immediately and refreshes in background.
         """
         cache_ttl = cfg.get("cache_ttl_minutes", 60)
 
@@ -203,6 +218,19 @@ class PortfolioManager:
                 age_seconds = (datetime.now() - datetime.fromisoformat(cached["timestamp"])).total_seconds()
                 if age_seconds < cache_ttl * 60:
                     cached["cache_status"] = "fresh"
+                    cached["cache_age_seconds"] = int(age_seconds)
+                    return cached
+                else:
+                    # Cache is stale — return it now, refresh in background
+                    with self._bg_refresh_lock:
+                        if not PortfolioManager._bg_refresh_running:
+                            PortfolioManager._bg_refresh_running = True
+                            threading.Thread(
+                                target=self._background_refresh,
+                                args=(cfg, accounts),
+                                daemon=True,
+                            ).start()
+                    cached["cache_status"] = "stale"
                     cached["cache_age_seconds"] = int(age_seconds)
                     return cached
 

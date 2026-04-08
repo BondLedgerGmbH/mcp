@@ -74,13 +74,15 @@ class IBHttpClient:
         logger.info("DELETE %s -> %d (%.1fs)", url, resp.status_code, duration)
         return resp
 
-    def health_check(self, port: int, timeout: int = 5) -> bool:
-        """Check if gateway is responding on given port. No rate limit."""
+    def health_check(self, port: int, timeout: int = 2) -> bool:
+        """Check if gateway is responding on given port. No rate limit, no retries."""
         try:
-            resp = self.post(
+            # Use a plain request without the retry adapter to avoid
+            # multi-second backoff delays on unreachable gateways.
+            resp = requests.post(
                 f"https://localhost:{port}/v1/api/iserver/auth/status",
                 timeout=timeout,
-                rate_limit=False
+                verify=False,
             )
             return resp.status_code == 200
         except Exception:

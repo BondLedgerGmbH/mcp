@@ -58,12 +58,15 @@ order_mgr = OrderManager(http=http, market_data=market_data)
 perf_mgr = PerformanceManager(cfg, http)
 
 # --- Startup readiness gate ---
-# Data tools block until the full startup workflow completes:
-# gateways running → authenticated → account IDs discovered → portfolio cached
+# Data tools block until at least one account completes the full startup workflow:
+# gateway running → authenticated → account ID discovered → portfolio cached
+# Accounts that fail to authenticate are tracked but do not block startup.
 
 _startup_ready = threading.Event()
 _startup_phase = "initializing"
 _startup_error = None
+_connected_accounts: list[str] = []      # accounts that completed startup
+_failed_accounts: dict[str, str] = {}    # account → reason for failure
 
 
 def _refresh_cfg():
@@ -97,11 +100,11 @@ except Exception as e:
 # the MCP server from accepting connections). Full flow:
 # 1. Start gateways that aren't running
 # 2. Open login pages for unauthenticated accounts
-# 3. Poll until all accounts are authenticated (up to 5 minutes)
-# 4. Auto-discover account IDs
-# 5. Warm up portfolio API session
-# 6. Pull and cache initial portfolio summary
-# 7. Set _startup_ready
+# 3. Poll until at least one account authenticates (up to 5 minutes)
+# 4. Auto-discover account IDs for authenticated accounts
+# 5. Warm up portfolio API session for authenticated accounts
+# 6. Pull and cache portfolio summary for connected accounts
+# 7. Set _startup_ready (partial availability — does not require all accounts)
 def _auto_start_gateways():
     global _startup_error
     try:
@@ -113,6 +116,8 @@ def _auto_start_gateways():
         # Phase 1: Start gateways and open login pages
         _set_phase("starting_gateways")
         needs_auth = []
+        already_auth = []
+        start_failed = []
         for acct in all_accounts:
             status = gateway.get_status(acct)
             if not status["gateway_running"]:
@@ -123,17 +128,21 @@ def _auto_start_gateways():
                     needs_auth.append(acct)
                     logger.info("Auto-started gateway and opened login for %s", acct)
                 else:
-                    _startup_error = f"Gateway start failed for {acct}: {result.get('error')}"
-                    _set_phase("error")
-                    return
+                    reason = f"Gateway start failed: {result.get('error')}"
+                    _failed_accounts[acct] = reason
+                    start_failed.append(acct)
+                    logger.warning("Gateway start failed for %s: %s", acct, result.get("error"))
             elif not status["authenticated"]:
                 gateway.open_login_page(acct)
                 needs_auth.append(acct)
                 logger.info("Gateway running but not authenticated for %s, opened login page", acct)
             else:
+                already_auth.append(acct)
                 logger.info("Gateway already running and authenticated for %s", acct)
 
         # Phase 2: Poll for auth completion (up to 5 minutes)
+        # Succeeds when at least one account authenticates (or some were already auth'd)
+        authenticated = list(already_auth)
         if needs_auth:
             _set_phase("waiting_for_auth")
             max_wait = 300
@@ -148,26 +157,38 @@ def _auto_start_gateways():
                     if status["authenticated"]:
                         logger.info("Authentication completed for %s", acct)
                         pending.discard(acct)
+                        authenticated.append(acct)
 
-            if pending:
-                _startup_error = f"Auth timed out after {max_wait}s for: {', '.join(pending)}"
-                _set_phase("error")
-                return
+            # Track timed-out accounts as failed, but don't abort startup
+            for acct in pending:
+                _failed_accounts[acct] = f"Authentication timed out after {max_wait}s"
+                logger.warning("Auth timed out for %s", acct)
 
-        logger.info("All accounts authenticated")
+        if not authenticated:
+            _startup_error = "No accounts authenticated. " + ", ".join(
+                f"{a}: {r}" for a, r in _failed_accounts.items()
+            )
+            _set_phase("error")
+            return
+
+        logger.info("Authenticated accounts: %s (failed: %s)",
+                     ", ".join(authenticated),
+                     ", ".join(_failed_accounts.keys()) if _failed_accounts else "none")
 
         # Phase 3: Auto-discover account IDs and warm up portfolio API
+        # Only for authenticated accounts
         _set_phase("discovering_accounts")
-        for acct in all_accounts:
+        ready_accounts = []
+        for acct in authenticated:
             acct_cfg = get_account_config(cfg, acct)
             if not acct_cfg.get("account_id"):
                 discovered = gateway.auto_discover_account_id(acct)
                 if discovered:
                     logger.info("Discovered account ID for %s: %s", acct, discovered)
+                    ready_accounts.append(acct)
                 else:
-                    _startup_error = f"Could not discover account ID for {acct}"
-                    _set_phase("error")
-                    return
+                    _failed_accounts[acct] = "Could not discover account ID"
+                    logger.warning("Could not discover account ID for %s", acct)
             else:
                 # Warm up the portfolio API session even if account_id is known
                 port = acct_cfg["port"]
@@ -176,16 +197,24 @@ def _auto_start_gateways():
                     logger.info("Portfolio API warmed up for %s", acct)
                 except Exception:
                     pass
+                ready_accounts.append(acct)
 
-        # Phase 4: Pull and cache initial portfolio summary
+        if not ready_accounts:
+            _startup_error = "No accounts ready after discovery. " + ", ".join(
+                f"{a}: {r}" for a, r in _failed_accounts.items()
+            )
+            _set_phase("error")
+            return
+
+        # Phase 4: Pull and cache initial portfolio summary for ready accounts
         _set_phase("loading_portfolio")
 
         # Reload config in case account IDs were just discovered
         _refresh_cfg()
 
-        result = portfolio.get_full_summary(cfg, all_accounts, force_refresh=True)
+        result = portfolio.get_full_summary(cfg, ready_accounts, force_refresh=True)
 
-        # Validate
+        # Validate — at least one account should have non-zero NAV
         balances = result.get("balances", {})
         has_nonzero_nav = any(
             b.get("nav", 0) != 0
@@ -193,7 +222,7 @@ def _auto_start_gateways():
             if k != "combined"
         )
         if not has_nonzero_nav:
-            _startup_error = "Portfolio loaded but all accounts show zero NAV"
+            _startup_error = "Portfolio loaded but all connected accounts show zero NAV"
             _set_phase("error")
             return
 
@@ -201,10 +230,18 @@ def _auto_start_gateways():
         total_nav = balances.get("combined", {}).get("total_nav", 0)
         logger.info("Portfolio loaded: %d positions, NAV $%.2f", total_positions, total_nav)
 
-        # Done
+        # Done — partial availability is OK
+        _connected_accounts.extend(ready_accounts)
         _set_phase("ready")
         _startup_ready.set()
-        logger.info("Startup complete: all gateways running, authenticated, portfolio cached")
+
+        if _failed_accounts:
+            logger.info("Startup complete (partial): %d/%d accounts connected. Failed: %s",
+                         len(ready_accounts), len(all_accounts),
+                         ", ".join(f"{a} ({r})" for a, r in _failed_accounts.items()))
+        else:
+            logger.info("Startup complete: all %d accounts connected, portfolio cached",
+                         len(ready_accounts))
 
     except Exception as e:
         _startup_error = str(e)
@@ -256,33 +293,50 @@ def _resolve_accounts(account: str) -> list:
     return [account]
 
 
-def _check_auth_error(accounts: list) -> dict | None:
-    """Check if any accounts need authentication. Return error dict or None."""
+def _filter_ready_accounts(accounts: list) -> tuple[list, dict | None]:
+    """Filter accounts to only those that are running and authenticated.
+
+    Returns (ready_accounts, error_or_none).
+    - If ALL requested accounts are unavailable: returns ([], error_dict)
+    - If SOME are available: returns (available_list, None) — partial availability
+    - If ALL are available: returns (all_list, None)
+
+    When account="all", unavailable accounts are silently filtered out (partial
+    availability). When a specific account is requested and it's not ready,
+    an error is returned.
+    """
     needs_auth = []
     not_running = []
+    ready = []
     for acct in accounts:
         status = gateway.get_status(acct)
         if not status["gateway_running"]:
             not_running.append(acct)
         elif not status["authenticated"]:
             needs_auth.append(acct)
+        else:
+            ready.append(acct)
 
+    # If we have at least some ready accounts, proceed with partial availability
+    if ready:
+        return ready, None
+
+    # No accounts ready — return an error
     if not_running:
         labels = [get_account_config(cfg, a).get("label", a) for a in not_running]
-        return {
+        return [], {
             "error": "gateway_not_running",
             "accounts_not_running": not_running,
             "message": f"Gateway not running for: {', '.join(labels)}. Use ib_start_gateway to start."
         }
     if needs_auth:
         labels = [get_account_config(cfg, a).get("label", a) for a in needs_auth]
-        urls = [f"https://localhost:{get_account_config(cfg, a)['port']}" for a in needs_auth]
-        return {
+        return [], {
             "error": "auth_required",
             "accounts_needing_auth": needs_auth,
             "message": f"Authentication required for: {', '.join(labels)}. Use ib_reauthenticate to open login pages."
         }
-    return None
+    return [], {"error": "no_accounts", "message": "No accounts configured."}
 
 
 # === Tools ===
@@ -309,6 +363,8 @@ def ib_status(account: str = "all") -> dict:
         "all_authenticated": all_auth,
         "startup_ready": _startup_ready.is_set(),
         "startup_phase": _startup_phase,
+        "connected_accounts": list(_connected_accounts),
+        "failed_accounts": dict(_failed_accounts),
         "gateway_version_date": gateway.gateway_version_date(),
         "update_available": cfg.get("update_available", False),
         "last_update_check": cfg.get("last_update_check"),
@@ -348,6 +404,10 @@ def ib_status(account: str = "all") -> dict:
         messages.append(f"Authentication required for: {', '.join(labels)}. Use ib_reauthenticate to open login pages.")
     if _startup_ready.is_set() and all_auth:
         messages.append("All accounts connected, authenticated, and portfolio data ready.")
+    elif _startup_ready.is_set() and _failed_accounts:
+        labels = [get_account_config(cfg, a).get("label", a) for a in _failed_accounts]
+        messages.append(f"Partial availability: {len(_connected_accounts)} account(s) connected. "
+                        f"Failed: {', '.join(labels)}.")
 
     result["message"] = " ".join(messages) if messages else "No gateways running."
 
@@ -469,22 +529,26 @@ def ib_portfolio_positions(account: str = "all") -> dict:
 
     accounts = _resolve_accounts(account)
 
-    # Tickle and check auth
+    # Tickle and filter to ready accounts (partial availability)
     gateway.tickle_all()
-    auth_error = _check_auth_error(accounts)
+    ready, auth_error = _filter_ready_accounts(accounts)
     if auth_error:
         return auth_error
 
     all_positions = []
-    for acct in accounts:
+    for acct in ready:
         positions = portfolio.get_positions(acct)
         all_positions.extend(positions)
 
-    return {
+    result = {
         "positions": all_positions,
         "total_positions": len(all_positions),
-        "accounts_queried": accounts
+        "accounts_queried": ready,
     }
+    skipped = [a for a in accounts if a not in ready]
+    if skipped:
+        result["accounts_unavailable"] = skipped
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -502,14 +566,14 @@ def ib_portfolio_balances(account: str = "all") -> dict:
 
     accounts = _resolve_accounts(account)
 
-    # Tickle and check auth
+    # Tickle and filter to ready accounts (partial availability)
     gateway.tickle_all()
-    auth_error = _check_auth_error(accounts)
+    ready, auth_error = _filter_ready_accounts(accounts)
     if auth_error:
         return auth_error
 
     all_balances = {}
-    for acct in accounts:
+    for acct in ready:
         balances = portfolio.get_balances(acct)
         if balances:
             all_balances[acct] = balances
@@ -520,10 +584,14 @@ def ib_portfolio_balances(account: str = "all") -> dict:
         "total_positions_value": sum(b.get("total_positions_value", 0) for b in all_balances.values()),
     }
 
-    return {
+    result = {
         "accounts": all_balances,
-        "combined": combined
+        "combined": combined,
     }
+    skipped = [a for a in accounts if a not in ready]
+    if skipped:
+        result["accounts_unavailable"] = skipped
+    return result
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
@@ -545,15 +613,15 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
 
     accounts = _resolve_accounts(account)
 
-    # Tickle and check auth
+    # Tickle and filter to ready accounts (partial availability)
     gateway.tickle_all()
-    auth_error = _check_auth_error(accounts)
+    ready, auth_error = _filter_ready_accounts(accounts)
     if auth_error:
         return auth_error
 
-    # Auto-discover account IDs if needed
+    # Auto-discover account IDs if needed (only for ready accounts)
     discovered_any = False
-    for acct in accounts:
+    for acct in ready:
         acct_cfg = get_account_config(cfg, acct)
         if not acct_cfg.get("account_id"):
             discovered = gateway.auto_discover_account_id(acct)
@@ -567,7 +635,7 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
     if discovered_any:
         _refresh_cfg()
 
-    result = portfolio.get_full_summary(cfg, accounts, force_refresh)
+    result = portfolio.get_full_summary(cfg, ready, force_refresh)
 
     # Validate: at least one account with non-zero NAV
     balances = result.get("balances", {})
@@ -579,10 +647,13 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
     if not has_nonzero_nav and balances:
         return {
             "error": "zero_nav",
-            "message": "Portfolio data returned but all accounts show zero NAV. "
+            "message": "Portfolio data returned but all connected accounts show zero NAV. "
                        "Verify accounts are funded and gateway is returning correct data."
         }
 
+    skipped = [a for a in accounts if a not in ready]
+    if skipped:
+        result["accounts_unavailable"] = skipped
     return result
 
 
@@ -618,11 +689,11 @@ def ib_option_chain(
     # Use first authenticated gateway for market data
     accounts = _resolve_accounts(account) if account else get_all_account_names(cfg)
     gateway.tickle_all()
-    auth_error = _check_auth_error(accounts[:1])
+    ready, auth_error = _filter_ready_accounts(accounts)
     if auth_error:
         return auth_error
 
-    port = get_account_config(cfg, accounts[0])["port"]
+    port = get_account_config(cfg, ready[0])["port"]
 
     result = market_data.get_option_chain(
         symbol=underlying,
@@ -671,11 +742,11 @@ def ib_market_snapshot(
 
     accounts = _resolve_accounts(account) if account else get_all_account_names(cfg)
     gateway.tickle_all()
-    auth_error = _check_auth_error(accounts[:1])
+    ready, auth_error = _filter_ready_accounts(accounts)
     if auth_error:
         return auth_error
 
-    port = get_account_config(cfg, accounts[0])["port"]
+    port = get_account_config(cfg, ready[0])["port"]
 
     result = market_data.get_quotes(symbols, port)
 
@@ -872,7 +943,7 @@ def ib_place_order(
                 "message": f"Account ID for {account} not yet discovered. Start gateway and authenticate first.",
             }
 
-    auth_error = _check_auth_error([account])
+    ready, auth_error = _filter_ready_accounts([account])
     if auth_error:
         return auth_error
 
@@ -1018,7 +1089,7 @@ def ib_order_preview(
                 "message": f"Account ID for {account} not yet discovered.",
             }
 
-    auth_error = _check_auth_error([account])
+    ready, auth_error = _filter_ready_accounts([account])
     if auth_error:
         return auth_error
 
@@ -1170,7 +1241,7 @@ def ib_cancel_order(account: str, order_id: str) -> dict:
                 "message": f"Account ID for {account} not yet discovered.",
             }
 
-    auth_error = _check_auth_error([account])
+    ready, auth_error = _filter_ready_accounts([account])
     if auth_error:
         return auth_error
 
