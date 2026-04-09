@@ -251,6 +251,88 @@ def _auto_start_gateways():
 threading.Thread(target=_auto_start_gateways, daemon=True).start()
 
 
+def _recover_after_reauth(accounts: list[str]):
+    """Re-run discovery + portfolio load for accounts that were reauthenticated.
+
+    Called in a background thread after ib_reauthenticate opens login pages.
+    Polls until accounts authenticate, then runs the same startup phases
+    (discover, warm-up, portfolio load) and clears the error state.
+    """
+    global _startup_error
+
+    # Poll until at least one account authenticates (up to 5 minutes)
+    max_wait = 300
+    poll_interval = 3
+    start_time = time.time()
+    pending = set(accounts)
+    authenticated = []
+
+    while pending and (time.time() - start_time) < max_wait:
+        time.sleep(poll_interval)
+        for acct in list(pending):
+            status = gateway.get_status(acct)
+            if status["authenticated"]:
+                logger.info("Recovery: authentication completed for %s", acct)
+                pending.discard(acct)
+                authenticated.append(acct)
+
+    if not authenticated:
+        logger.warning("Recovery: no accounts authenticated within timeout")
+        return
+
+    # Clear failed state for accounts that are now authenticated
+    for acct in authenticated:
+        _failed_accounts.pop(acct, None)
+
+    # Discover account IDs + warm up portfolio API
+    ready_accounts = []
+    for acct in authenticated:
+        if acct in _connected_accounts:
+            ready_accounts.append(acct)
+            continue
+        acct_cfg = get_account_config(cfg, acct)
+        if not acct_cfg.get("account_id"):
+            discovered = gateway.auto_discover_account_id(acct)
+            if discovered:
+                logger.info("Recovery: discovered account ID for %s: %s", acct, discovered)
+                ready_accounts.append(acct)
+            else:
+                logger.warning("Recovery: could not discover account ID for %s", acct)
+        else:
+            port = acct_cfg["port"]
+            try:
+                http.get(f"https://localhost:{port}/v1/api/portfolio/accounts")
+                logger.info("Recovery: portfolio API warmed up for %s", acct)
+            except Exception:
+                pass
+            ready_accounts.append(acct)
+
+    if not ready_accounts:
+        logger.warning("Recovery: no accounts ready after discovery")
+        return
+
+    # Reload config in case account IDs were just discovered
+    _refresh_cfg()
+
+    # Pull portfolio data
+    try:
+        result = portfolio.get_full_summary(cfg, ready_accounts, force_refresh=True)
+        total_positions = len(result.get("positions", []))
+        logger.info("Recovery: portfolio loaded — %d positions", total_positions)
+    except Exception as e:
+        logger.warning("Recovery: portfolio load failed: %s", e)
+
+    # Update connected accounts and clear error state
+    for acct in ready_accounts:
+        if acct not in _connected_accounts:
+            _connected_accounts.append(acct)
+
+    _startup_error = None
+    _set_phase("ready")
+    _startup_ready.set()
+    logger.info("Recovery complete: %s now connected", ", ".join(ready_accounts))
+
+
 def _check_startup_ready() -> dict | None:
     """Return error dict if startup hasn't completed, None if ready."""
     if _startup_ready.is_set():
@@ -508,6 +590,15 @@ def ib_reauthenticate(account: str = "all") -> dict:
     if opened:
         labels = [o["label"] for o in opened]
         response["message"] = f"Login page(s) opened for: {', '.join(labels)}. Complete authentication in your browser."
+
+        # Launch background recovery to clear startup error state once auth completes
+        reauth_accounts = [o["account"] for o in opened]
+        threading.Thread(
+            target=_recover_after_reauth,
+            args=(reauth_accounts,),
+            daemon=True
+        ).start()
+
     if errors:
         response["errors"] = errors
 
@@ -1263,7 +1354,7 @@ def ib_performance(account: str = "all", periods: str = "") -> dict:
     history including dividends, fees, and FX effects.
 
     Args:
-        account: Account name (e.g., "account1", "account2") or "all". Default: "all".
+        account: Account name (e.g., "gmbh", "personal") or "all". Default: "all".
         periods: Comma-separated periods to fetch. Valid: 1D, 7D, MTD, 1M, YTD, 1Y.
                  Default (empty): fetches all periods.
     """
