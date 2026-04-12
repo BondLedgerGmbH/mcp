@@ -7,13 +7,12 @@ MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecy
 - Multi-account gateway management (start, stop, re-authenticate)
 - Live and paper trading modes (paper accounts excluded from auto-start and "all" resolution)
 - Auto-discovery of IB account IDs on first connection
-- Portfolio data: positions, balances, allocations, concentration flags, correlation cluster analysis
+- Portfolio data: positions, balances, allocations, concentration flags
 - Market data: multi-symbol snapshots with inverse ETF metadata
 - Option chains: filtered by strike range with live pricing, IV, and greeks
 - Order management: place, preview (what-if), status, and cancel orders
 - Smart ticker resolution: portfolio positions → IB search → disambiguation
 - Cash-based ordering (specify dollar amount instead of shares)
-- Correlation cluster detection via Claude Haiku (identifies correlated risk groups)
 - Portfolio caching with configurable TTL
 - FX rate conversion for multi-currency portfolios
 - Gateway auto-update with rollback support
@@ -23,9 +22,7 @@ MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecy
 - Python 3.12+
 - Java (for IB Client Portal Gateway): `brew install openjdk`
 - [FastMCP](https://github.com/jlowin/fastmcp) 3.0+
-- [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) (for correlation cluster analysis)
 - An Interactive Brokers account
-- Anthropic API key in macOS Keychain (service name: `anthropic-api-key`)
 
 ## Installation
 
@@ -37,7 +34,7 @@ git clone https://github.com/BondLedgerGmbH/ib-connect.git ~/.ib-connect
 cd ~/.ib-connect
 python3 -m venv venv
 source venv/bin/activate
-pip install fastmcp requests anthropic
+pip install fastmcp requests
 ```
 
 ## Configuration
@@ -107,7 +104,7 @@ Add to your MCP configuration:
 | `ib_reauthenticate` | Re-open login page for expired sessions |
 | `ib_portfolio_positions` | Retrieve current positions |
 | `ib_portfolio_balances` | Retrieve account balances and NAV |
-| `ib_portfolio_summary` | Combined view: positions + balances + allocations + concentration flags + correlation clusters |
+| `ib_portfolio_summary` | Combined view: positions + balances + allocations + concentration flags |
 | `ib_option_chain` | Filtered option chain with live pricing, IV, and greeks |
 | `ib_market_snapshot` | Market data snapshots for multiple symbols |
 | `ib_place_order` | Place an order (market, limit, stop, stop-limit) |
@@ -133,7 +130,6 @@ On MCP server connect, the server automatically:
 4. Auto-discovers account IDs if not configured
 5. Warms up the portfolio API session
 6. Pulls and caches initial portfolio data
-7. Evaluates correlation clusters via Claude Haiku and caches results
 
 Data tools block until this startup sequence completes.
 

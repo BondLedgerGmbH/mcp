@@ -214,14 +214,6 @@ def _auto_start_gateways():
 
         result = portfolio.get_full_summary(cfg, ready_accounts, force_refresh=True)
 
-        # Evaluate correlation clusters on startup
-        try:
-            positions = result.get("positions", [])
-            total_nav = result.get("balances", {}).get("combined", {}).get("total_nav", 0)
-            portfolio.evaluate_correlation_clusters(cfg, positions, total_nav)
-        except Exception as e:
-            logger.warning("Startup: cluster evaluation failed (non-blocking): %s", e)
-
         # Validate — at least one account should have non-zero NAV
         balances = result.get("balances", {})
         has_nonzero_nav = any(
@@ -327,13 +319,6 @@ def _recover_after_reauth(accounts: list[str]):
         result = portfolio.get_full_summary(cfg, ready_accounts, force_refresh=True)
         total_positions = len(result.get("positions", []))
         logger.info("Recovery: portfolio loaded — %d positions", total_positions)
-        # Evaluate correlation clusters on recovery
-        try:
-            positions = result.get("positions", [])
-            total_nav = result.get("balances", {}).get("combined", {}).get("total_nav", 0)
-            portfolio.evaluate_correlation_clusters(cfg, positions, total_nav)
-        except Exception as e:
-            logger.warning("Recovery: cluster evaluation failed (non-blocking): %s", e)
     except Exception as e:
         logger.warning("Recovery: portfolio load failed: %s", e)
 
@@ -742,15 +727,6 @@ def ib_portfolio_summary(account: str = "all", force_refresh: bool = False) -> d
         _refresh_cfg()
 
     result = portfolio.get_full_summary(cfg, ready, force_refresh)
-
-    # Evaluate correlation clusters (MCP server owns this — requires anthropic SDK)
-    try:
-        positions = result.get("positions", [])
-        total_nav = result.get("balances", {}).get("combined", {}).get("total_nav", 0)
-        clusters = portfolio.evaluate_correlation_clusters(cfg, positions, total_nav)
-        result["correlation_clusters"] = clusters
-    except Exception as e:
-        logger.error("Correlation cluster evaluation failed (non-blocking): %s", e)
 
     # Validate: at least one account with non-zero NAV
     balances = result.get("balances", {})

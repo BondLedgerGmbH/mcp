@@ -310,9 +310,6 @@ class PortfolioManager:
             all_positions, combined["total_nav"], thresholds
         )
 
-        # Read correlation clusters from cache (written by MCP server)
-        correlation_clusters = self._read_cluster_cache()
-
         timestamp = datetime.now().isoformat()
         result = {
             "timestamp": timestamp,
@@ -323,83 +320,12 @@ class PortfolioManager:
             "positions": all_positions,
             "allocations": allocations,
             "concentration_flags": concentration_flags,
-            "correlation_clusters": correlation_clusters,
         }
 
         # Save to cache
         self._save_cache(result, timestamp)
 
         return result
-
-    def _read_cluster_cache(self) -> list:
-        """Read correlation clusters from cache file. Never evaluates."""
-        try:
-            from server.clusters import load_cluster_cache
-            cached = load_cluster_cache()
-            if cached is not None:
-                logger.info("Correlation clusters: loaded from cache (%d clusters)", len(cached))
-                return cached
-        except Exception as e:
-            logger.warning("Could not read cluster cache: %s", e)
-        return []
-
-    def evaluate_correlation_clusters(self, cfg: dict, positions: list, total_nav: float) -> list:
-        """Evaluate correlation clusters via Claude API. Called only by MCP server.
-
-        Checks if portfolio changed before re-evaluating. Results are saved
-        to cache for consumers (e.g. trading-factory dashboard) to read.
-
-        Never raises — all failures are logged as errors and return [].
-        """
-        try:
-            from server.clusters import (
-                detect_portfolio_change, evaluate_clusters,
-                load_cluster_cache, save_cluster_cache,
-            )
-
-            # Check if portfolio changed vs last evaluation
-            cached = self._load_cache()
-            cached_positions = cached.get("positions", []) if cached else []
-
-            if not detect_portfolio_change(cached_positions, positions):
-                cached_clusters = load_cluster_cache()
-                if cached_clusters is not None:
-                    logger.info("Correlation clusters: no portfolio change, using cache (%d clusters)", len(cached_clusters))
-                    return cached_clusters
-
-            logger.info("Correlation clusters: evaluating (portfolio changed)")
-
-            # Get manual assets from trading-factory DB if available
-            manual_assets = []
-            try:
-                import sys
-                from pathlib import Path
-                tf_src = Path.home() / "Projects" / "product-factory" / "trading-factory" / "src"
-                if str(tf_src) not in sys.path:
-                    sys.path.insert(0, str(tf_src))
-                from trading_factory.db.postgres import get_session
-                from trading_factory.models.pg_models import ManualAsset
-                with get_session() as session:
-                    assets = session.query(ManualAsset).all()
-                    manual_assets = [
-                        {"name": a.name, "asset_type": a.asset_type, "value": a.value}
-                        for a in assets
-                    ]
-            except Exception as e:
-                logger.warning("Could not load manual assets for cluster analysis: %s", e)
-
-            threshold = cfg.get("concentration_thresholds", {}).get("cluster_pct", 10.0)
-            clusters = evaluate_clusters(
-                positions, manual_assets, total_nav + sum(a["value"] for a in manual_assets),
-                cluster_threshold_pct=threshold,
-            )
-
-            save_cluster_cache(clusters, datetime.now().isoformat())
-            return clusters
-
-        except Exception as e:
-            logger.error("Correlation cluster evaluation failed: %s", e)
-            return []
 
     def _compute_allocations(self, positions: list, total_nav: float) -> dict:
         """Compute allocation breakdowns from positions using USD-normalized values."""
