@@ -7,12 +7,13 @@ MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecy
 - Multi-account gateway management (start, stop, re-authenticate)
 - Live and paper trading modes (paper accounts excluded from auto-start and "all" resolution)
 - Auto-discovery of IB account IDs on first connection
-- Portfolio data: positions, balances, allocations, concentration flags
+- Portfolio data: positions, balances, allocations, concentration flags, correlation cluster analysis
 - Market data: multi-symbol snapshots with inverse ETF metadata
 - Option chains: filtered by strike range with live pricing, IV, and greeks
 - Order management: place, preview (what-if), status, and cancel orders
 - Smart ticker resolution: portfolio positions → IB search → disambiguation
 - Cash-based ordering (specify dollar amount instead of shares)
+- Correlation cluster detection via Claude Haiku (identifies correlated risk groups)
 - Portfolio caching with configurable TTL
 - FX rate conversion for multi-currency portfolios
 - Gateway auto-update with rollback support
@@ -22,7 +23,9 @@ MCP server for Interactive Brokers Client Portal Gateway. Manages gateway lifecy
 - Python 3.12+
 - Java (for IB Client Portal Gateway): `brew install openjdk`
 - [FastMCP](https://github.com/jlowin/fastmcp) 3.0+
+- [Anthropic Python SDK](https://github.com/anthropics/anthropic-sdk-python) (for correlation cluster analysis)
 - An Interactive Brokers account
+- Anthropic API key in macOS Keychain (service name: `anthropic-api-key`)
 
 ## Installation
 
@@ -34,7 +37,7 @@ git clone https://github.com/BondLedgerGmbH/ib-connect.git ~/.ib-connect
 cd ~/.ib-connect
 python3 -m venv venv
 source venv/bin/activate
-pip install fastmcp requests
+pip install fastmcp requests anthropic
 ```
 
 ## Configuration
@@ -104,7 +107,7 @@ Add to your MCP configuration:
 | `ib_reauthenticate` | Re-open login page for expired sessions |
 | `ib_portfolio_positions` | Retrieve current positions |
 | `ib_portfolio_balances` | Retrieve account balances and NAV |
-| `ib_portfolio_summary` | Combined view: positions + balances + allocations + concentration flags |
+| `ib_portfolio_summary` | Combined view: positions + balances + allocations + concentration flags + correlation clusters |
 | `ib_option_chain` | Filtered option chain with live pricing, IV, and greeks |
 | `ib_market_snapshot` | Market data snapshots for multiple symbols |
 | `ib_place_order` | Place an order (market, limit, stop, stop-limit) |
@@ -120,50 +123,6 @@ The IB Client Portal Gateway snapshot API has these limitations that consumers s
 - **`theta` and `vega`**: Always null. The snapshot endpoint does not return these greeks.
 - **`open_interest`**: Always null. Not provided by the snapshot endpoint.
 
-### Architecture
-
-```
-Claude Code
-    │
-    │ MCP (stdio transport)
-    ▼
-ib-connect MCP Server (Python/FastMCP)
-    │
-    │ HTTPS (self-signed cert)
-    ▼
-IB Client Portal Gateway (Java)  ×N instances (one per account)
-    │              │
-    │ port 5100    │ port 5101    ...
-    ▼              ▼
-Account A      Account B      ...
-(live)         (live/paper)
-```
-
-### Directory Structure
-
-```
-~/.ib-connect/
-├── run_server.py              # Entry point
-├── config.json                # Account config (generated from example)
-├── config.example.json        # Template config
-├── server/
-│   ├── __init__.py
-│   ├── __main__.py
-│   ├── server.py              # FastMCP tool definitions (13 tools)
-│   ├── config.py              # Config management
-│   ├── gateway.py             # Gateway lifecycle (start/stop/auth/update)
-│   ├── http_client.py         # Rate-limited HTTP client for IB API
-│   ├── market_data.py         # Security search, option chains, snapshots
-│   ├── orders.py              # Order placement, preview, status, cancellation
-│   └── portfolio.py           # Positions, balances, allocations, caching
-├── gateway/                   # IB CP Gateway base installation (Java)
-├── gateway-<account>/         # Per-account gateway copies (created on first start)
-├── cache/                     # Portfolio data cache (configurable TTL)
-├── logs/                      # Server and gateway logs
-├── pids/                      # Gateway PID files
-└── venv/                      # Python virtual environment
-```
-
 ## Startup Behaviour
 
 On MCP server connect, the server automatically:
@@ -174,44 +133,9 @@ On MCP server connect, the server automatically:
 4. Auto-discovers account IDs if not configured
 5. Warms up the portfolio API session
 6. Pulls and caches initial portfolio data
+7. Evaluates correlation clusters via Claude Haiku and caches results
 
 Data tools block until this startup sequence completes.
-
-### Market Data Notes
-
-- The snapshot endpoint has a subscription warm-up: first call may return stale/empty data, second call after ~1.5s returns live data. The server handles this with automatic retry (up to 3 attempts).
-- After data retrieval, subscriptions are cleaned up via `unsubscribeall` to free slots.
-- Maximum ~100 concurrent market data subscriptions per gateway session.
-
-Option chain retrieval pipeline:
-1. Symbol search → conid resolution (cached)
-2. Available strikes for expiry month
-3. Filter strikes to specified % range of current price (capped at 30)
-4. Resolve individual option contract conids
-5. Batch market data snapshots (groups of 20)
-6. Combine and return structured data with greeks
-
-### Gateway Update Management
-
-The server checks for gateway updates every 24 hours (HEAD request to IB download URL). Updates are applied via `ib_start_gateway` with automatic rollback if the new version fails to start.
-
-### Logs
-
-- Server log: `~/.ib-connect/logs/mcp-server.log`
-- Gateway logs: `~/.ib-connect/logs/gateway-{account}.log`
-- Log rotation at 10MB
-
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| "startup_in_progress" on tool calls | Wait for auth to complete, or check logs for errors |
-| "gateway_not_running" | Run `ib_start_gateway` |
-| "auth_required" | Run `ib_reauthenticate`, complete browser login |
-| Option chain returns no data | Check market hours, verify underlying is optionable |
-| Snapshot returns stale "C"-prefixed values | Market is closed; data is closing prices |
-| Port conflict | Check for other processes; disable AirPlay Receiver if on 5000/5001 |
-| Paper account not starting | Paper accounts have `auto_start: false` — start manually |
 
 ## License
 
