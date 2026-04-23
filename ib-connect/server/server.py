@@ -251,23 +251,60 @@ def _auto_start_gateways():
 threading.Thread(target=_auto_start_gateways, daemon=True).start()
 
 
+def _keepalive_loop():
+    """Tickle every running gateway once a minute to prevent session expiry.
+
+    IBKR's Client Portal Gateway invalidates its SSO binding server-side after
+    a period of inactivity. Once invalidated, the only recovery is a full
+    process restart (see `_recover_after_reauth`). Regular tickles avoid that
+    state entirely, up to IBKR's hard 24h session limit.
+
+    `tickle_all` only tickles gateways that are running; it is a no-op for
+    stopped accounts.
+    """
+    KEEPALIVE_INTERVAL_SEC = 60
+    while True:
+        try:
+            time.sleep(KEEPALIVE_INTERVAL_SEC)
+            gateway.tickle_all()
+        except Exception as e:
+            logger.warning("Keepalive: tickle sweep failed: %s", e)
+
+
+threading.Thread(target=_keepalive_loop, daemon=True, name="ib-keepalive").start()
+
+
 def _recover_after_reauth(accounts: list[str]):
     """Re-run discovery + portfolio load for accounts that were reauthenticated.
 
     Called in a background thread after ib_reauthenticate opens login pages.
     Polls until accounts authenticate, then runs the same startup phases
     (discover, warm-up, portfolio load) and clears the error state.
+
+    Zombie detection: if a gateway process is still running but not returning
+    authenticated=true after ZOMBIE_THRESHOLD_SEC, the gateway's internal SSO
+    binding is stale. IBKR CP Gateway cannot recover from that state via the
+    browser alone — the Java process must restart. We do that here up to
+    MAX_RESTART_ATTEMPTS times before giving up.
     """
     global _startup_error
 
-    # Poll until at least one account authenticates (up to 5 minutes)
+    # 90s is long enough that an actively-logging-in user (typing creds, approving 2FA
+    # on phone) won't get their session killed mid-login. A zombie gateway will never
+    # flip to authenticated, so the extra wait only adds latency in the failure case.
+    ZOMBIE_THRESHOLD_SEC = 90
+    MAX_RESTART_ATTEMPTS = 2
+
     max_wait = 300
     poll_interval = 3
-    start_time = time.time()
+    overall_start = time.time()
     pending = set(accounts)
     authenticated = []
 
-    while pending and (time.time() - start_time) < max_wait:
+    # Per-account timers: when polling for this account began + how many restarts tried
+    account_state = {acct: {"started_at": time.time(), "restarts": 0} for acct in accounts}
+
+    while pending and (time.time() - overall_start) < max_wait:
         time.sleep(poll_interval)
         for acct in list(pending):
             status = gateway.get_status(acct)
@@ -275,10 +312,51 @@ def _recover_after_reauth(accounts: list[str]):
                 logger.info("Recovery: authentication completed for %s", acct)
                 pending.discard(acct)
                 authenticated.append(acct)
+                continue
+
+            elapsed = time.time() - account_state[acct]["started_at"]
+            if elapsed < ZOMBIE_THRESHOLD_SEC or not status["gateway_running"]:
+                continue
+
+            # Zombie: gateway running, user presumably logged in, but auth/status still false.
+            # Restart the process and reopen the login page.
+            restarts = account_state[acct]["restarts"]
+            if restarts >= MAX_RESTART_ATTEMPTS:
+                logger.error(
+                    "Recovery: %s did not authenticate after %d auto-restart attempts; "
+                    "giving up on this account. Run ib_stop_gateway then ib_start_gateway manually.",
+                    acct, MAX_RESTART_ATTEMPTS,
+                )
+                pending.discard(acct)
+                continue
+
+            logger.warning(
+                "Recovery: zombie gateway detected for %s after %.0fs (running but not authenticated). "
+                "Restarting process (attempt %d/%d).",
+                acct, elapsed, restarts + 1, MAX_RESTART_ATTEMPTS,
+            )
+            gateway.stop(acct)
+            time.sleep(2)
+            start_result = gateway.start(acct)
+            if start_result.get("status") in ("started", "already_running"):
+                time.sleep(3)  # let HTTP come up
+                gateway.open_login_page(acct)
+            else:
+                logger.error("Recovery: restart failed for %s: %s", acct, start_result)
+            account_state[acct]["started_at"] = time.time()
+            account_state[acct]["restarts"] = restarts + 1
 
     if not authenticated:
         logger.warning("Recovery: no accounts authenticated within timeout")
         return
+
+    # Initialize brokerage session (ssodh/init). wait_for_auth does this on initial
+    # startup; without it, /iserver/auth/status can be true while trading APIs still
+    # fail with "no brokerage session". Mirror that here.
+    for acct in authenticated:
+        acct_cfg = get_account_config(cfg, acct)
+        if not http.init_brokerage_session(acct_cfg["port"]):
+            logger.warning("Recovery: init_brokerage_session failed for %s (non-fatal)", acct)
 
     # Clear failed state for accounts that are now authenticated
     for acct in authenticated:
@@ -571,6 +649,7 @@ def ib_reauthenticate(account: str = "all") -> dict:
     accounts = _resolve_accounts(account)
 
     opened = []
+    soft_reauthed = []
     errors = []
 
     for acct in accounts:
@@ -581,16 +660,34 @@ def ib_reauthenticate(account: str = "all") -> dict:
             })
             continue
 
-        url = gateway.open_login_page(acct)
         acct_cfg = get_account_config(cfg, acct)
+        port = acct_cfg["port"]
+
+        # Try the IBKR soft-reauth endpoint first. If the session is merely
+        # suspended (not fully expired), this refreshes it without a browser
+        # roundtrip — saving the user a 2FA tap.
+        if http.soft_reauthenticate(port):
+            time.sleep(2)  # gateway takes a moment to settle
+            if gateway.get_status(acct)["authenticated"]:
+                logger.info("Soft reauth succeeded for %s — browser not needed", acct)
+                soft_reauthed.append({"account": acct, "label": acct_cfg.get("label", acct)})
+                continue
+
+        url = gateway.open_login_page(acct)
         opened.append({"account": acct, "url": url, "label": acct_cfg.get("label", acct)})
 
-    response = {"accounts_opened": [o["account"] for o in opened]}
+    response = {
+        "accounts_opened": [o["account"] for o in opened],
+        "soft_reauthed": [s["account"] for s in soft_reauthed],
+    }
 
+    messages = []
+    if soft_reauthed:
+        labels = [s["label"] for s in soft_reauthed]
+        messages.append(f"Soft reauth succeeded (no browser needed) for: {', '.join(labels)}.")
     if opened:
         labels = [o["label"] for o in opened]
-        response["message"] = f"Login page(s) opened for: {', '.join(labels)}. Complete authentication in your browser."
-
+        messages.append(f"Login page(s) opened for: {', '.join(labels)}. Complete authentication in your browser.")
         # Launch background recovery to clear startup error state once auth completes
         reauth_accounts = [o["account"] for o in opened]
         threading.Thread(
@@ -598,6 +695,9 @@ def ib_reauthenticate(account: str = "all") -> dict:
             args=(reauth_accounts,),
             daemon=True
         ).start()
+
+    if messages:
+        response["message"] = " ".join(messages)
 
     if errors:
         response["errors"] = errors

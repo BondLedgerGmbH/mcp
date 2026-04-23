@@ -114,6 +114,27 @@ class IBHttpClient:
         except Exception:
             return False
 
+    def soft_reauthenticate(self, port: int) -> bool:
+        """Call /v1/api/iserver/reauthenticate to refresh a suspended session.
+
+        Works when IBKR has suspended the session but the SSO binding is still
+        intact (competing=false, authenticated=false in auth/status). Does NOT
+        help when the gateway is fully zombied — caller must still re-check
+        auth_status after to confirm.
+
+        Returns True if the POST returned 200; the caller must then verify
+        authenticated=true via auth_status.
+        """
+        try:
+            resp = self.post(
+                f"https://localhost:{port}/v1/api/iserver/reauthenticate",
+                timeout=10,
+                rate_limit=False,
+            )
+            return resp.status_code == 200
+        except Exception:
+            return False
+
     def init_brokerage_session(self, port: int) -> bool:
         """Initialize brokerage session after auth."""
         try:
